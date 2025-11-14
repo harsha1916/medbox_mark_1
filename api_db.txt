@@ -1,0 +1,79 @@
+rtsp://admin:Maxpark19@192.168.0.251:554/cam/realmonitor?channel=1&subtype=1
+
+rtsp://admin:Maxpark19@192.168.0.253:554/cam/realmonitor?channel=1&subtype=1
+
+66d06d26ac5f6a672774ad68
+
+/home/maxpark/Documents/max_photo_pref_json_2
+
+
+ESP32:
+
+POST URL → http://<pi-ip>:8000/medbox/upload
+
+GET URL → http://<pi-ip>:8000/medbox/changes
+
+Your app / tools can:
+
+List devices:
+GET http://<pi-ip>:8000/api/devices
+
+Get full device info:
+GET http://<pi-ip>:8000/api/devices/MEDBOX_XXXX
+
+Get meds:
+GET http://<pi-ip>:8000/api/devices/MEDBOX_XXXX/meds
+
+See pending commands:
+GET http://<pi-ip>:8000/api/devices/MEDBOX_XXXX/commands/pending
+
+See history:
+GET http://<pi-ip>:8000/api/devices/MEDBOX_XXXX/commands/history
+
+POST /medbox/<device_id>/command/edit
+
+POST /api/devices/<device_id>/commands/edit (just a nicer /api/ path)
+
+Both expect JSON like this:
+
+{
+  "id": 1,
+  "name": "Metformin 500mg",
+  "qty": 2,
+  "hour": 21,
+  "minute": 0,
+  "led": 4,
+  "enabled": true
+}
+
+POST http://<pi-ip>:8000/api/devices/MEDBOX_24A160FF01AB/commands/edit
+Body (JSON):
+
+json
+Copy code
+{
+  "id": 1,
+  "hour": 21,
+  "minute": 30,
+  "qty": 2
+}
+
+
+How to see if the edit went through
+
+Before ESP32 polls:
+
+GET http://<pi-ip>:8000/api/devices/MEDBOX_24A160FF01AB/commands/pending
+
+
+You’ll see your edit command there.
+
+After ESP32 polls /medbox/changes:
+
+Pending becomes empty
+
+History shows the sent command:
+
+GET http://<pi-ip>:8000/api/devices/MEDBOX_24A160FF01AB/commands/history
+
+GET http://<pi-ip>:8000/api/devices/MEDBOX_24A160FF01AB/meds
