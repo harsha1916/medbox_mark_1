@@ -72,6 +72,18 @@ After ESP32 polls /medbox/changes:
 
 Pending becomes empty
 
+adding med
+https://integrated_anpr.easyslot.in/medbox/MEDBOX_000000000000/command/add
+
+{
+  "name": "Dolo 6",
+  "qty": 1,
+  "hour": 17,
+  "minute": 43,
+  "led": 2,
+  "enabled": true
+}
+
 History shows the sent command:
 
 GET http://<pi-ip>:8000/api/devices/MEDBOX_24A160FF01AB/commands/history
