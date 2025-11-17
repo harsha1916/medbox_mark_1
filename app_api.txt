@@ -1,0 +1,365 @@
+📄 MEDBOX ESP32 – COMPLETE API SPECIFICATION (FOR MOBILE APP INTEGRATION)
+
+Version: 2.0 — Updated for SoftAP + WiFi Config + Local APIs + Cloud Sync
+
+0. GENERAL INFORMATION
+
+The MedBox ESP32 device works in two modes:
+
+0.1 SOFTAP MODE (CONFIG MODE)
+
+SSID: MedBoxConfig
+Password: medbox
+Base URL:http://192.168.4.1
+
+or http://medboxconfig.local
+
+Used for:
+
+Setting WiFi details from the app
+
+Saving SSID/password to NVS
+
+Restarting device to join router network
+
+No API_KEY required in SoftAP mode.
+
+0.2 NORMAL MODE (HOME WIFI MODE)
+
+Base URL:
+
+http://<DEVICE-IP>
+
+or http://medbox.local
+
+Used for:
+
+Managing medicines
+
+Controlling alarm settings
+
+Cloud sync
+
+App → Device communication
+
+API_KEY required: MEDBOX2025
+
+1. AUTHENTICATION (Normal Mode Only)
+
+Every local API (except WiFi config in SoftAP) requires the API key.
+
+Methods to send:
+(a) HTTP Header
+API_KEY: MEDBOX2025
+
+(b) Query Parameter
+?api_key=MEDBOX2025
+
+
+or
+
+?key=MEDBOX2025
+
+2. SOFTAP CONFIGURATION APIs (USED BY MOBILE APP)
+
+Base URL in SoftAP:
+
+http://192.168.4.1
+or
+http://medboxconfig.local
+
+2.1 GET /
+
+Displays HTML WiFi setup page.
+
+2.2 POST /savewifi (Browser Form)
+
+Used by web dashboard only.
+
+2.3 POST /api/wifi (MOBILE APP MUST USE THIS)
+
+Purpose: Save WiFi credentials into ESP32 NVS and restart.
+
+Method: POST
+Auth: NONE
+Content-Type: application/json
+
+Request JSON:
+{
+  "ssid": "YourWiFiName",
+  "pass": "Password123"
+}
+
+Successful Response:
+{
+  "status": "saved_rebooting"
+}
+
+
+Device will reboot after 1.5 seconds.
+
+3. LOCAL APIs (NORMAL MODE – ON USER'S WIFI)
+
+Base URL:
+
+http://medbox.local
+or
+http://<esp32-ip>
+
+
+Requires API_KEY.
+
+3.1 GET /api/meds
+
+Returns list of medicines.
+
+Response:
+{
+  "deviceId": "maxpark03",
+  "count": 2,
+  "meds": [
+    {
+      "id": 0,
+      "name": "Dolo 650",
+      "qty": 1,
+      "hour": 9,
+      "minute": 30,
+      "led": 2,
+      "enabled": true
+    }
+  ]
+}
+
+3.2 POST /api/add
+
+Adds new medicine.
+
+Request JSON:
+{
+  "name": "NewMed",
+  "qty": 1,
+  "hour": 9,
+  "minute": 30,
+  "led": 1,
+  "enabled": true
+}
+
+Response:
+{"status": "added"}
+
+3.3 POST /api/edit?id=<id>
+
+Edits existing medicine.
+
+Example URL:
+/api/edit?id=0
+
+JSON Body:
+{
+  "name": "Updated Name",
+  "qty": 2
+}
+
+Response:
+{"status": "updated"}
+
+3.4 POST /api/delete?id=<id>
+Response:
+{"status": "deleted"}
+
+3.5 POST /api/toggle?id=<id>
+Response:
+{"status": "toggled"}
+
+3.6 GET /api/time
+
+Returns DS3231 RTC time.
+
+{
+  "year": 2025,
+  "month": 1,
+  "day": 10,
+  "hour": 14,
+  "minute": 30,
+  "second": 20
+}
+
+3.7 POST /api/test
+
+Triggers test alarm.
+
+{"status": "alarm_test_started"}
+
+3.8 GET /api/settings
+
+Returns device settings.
+
+{
+  "deviceId": "maxpark03",
+  "alarmDuration": 10,
+  "cloudPostUrl": "https://server.com/upload",
+  "cloudGetUrl": "https://server.com/commands",
+  "onlineSync": true,
+  "internet": true
+}
+
+3.9 POST /api/settings
+
+Update settings.
+
+JSON:
+{
+  "alarmDuration": 15,
+  "cloudPostUrl": "https://server.com/upload",
+  "cloudGetUrl": "https://server.com/commands",
+  "onlineSync": true
+}
+
+3.10 POST /api/sync_ntp
+
+Sync RTC with internet time.
+
+Response:
+{"status": "synced_ntp"}
+
+3.11 POST /api/set_time
+
+Manually update RTC.
+
+JSON:
+{
+  "year": 2025,
+  "month": 1,
+  "day": 10,
+  "hour": 14,
+  "minute": 45,
+  "second": 0
+}
+
+Response:
+{"status": "rtc_set"}
+
+4. CLOUD APIs (SERVER-SIDE — RECEIVED BY RASPBERRY PI)
+
+ESP32 can POST and GET to your cloud URLs.
+
+You can run a small Python Flask/FastAPI server to handle these.
+
+4.1 ESP32 → CLOUD (POST)
+
+Triggered when:
+
+Medicine added
+
+Medicine edited
+
+Medicine deleted
+
+Cloud settings changed
+
+Requires: NONE (unless you add custom auth)
+JSON sent by ESP32:
+{
+  "deviceId": "maxpark03",
+  "count": 2,
+  "meds": [
+    { "id": 0, "name": "Med1", "qty": 1, "hour": 9, "minute": 30, "led": 1, "enabled": true },
+    { "id": 1, "name": "Med2", "qty": 1, "hour": 22, "minute": 0, "led": 2, "enabled": false }
+  ]
+}
+
+4.2 CLOUD → ESP32 (GET polling every 2 minutes)
+
+ESP32 calls:
+
+GET <cloudGetUrl>?deviceId=maxpark03
+
+Example JSON returned to ESP32:
+{
+  "commands": [
+    {
+      "op": "add",
+      "name": "BP Tablet",
+      "qty": 1,
+      "hour": 8,
+      "minute": 0,
+      "led": 3,
+      "enabled": true
+    },
+    {
+      "op": "edit",
+      "id": 0,
+      "hour": 10
+    },
+    {
+      "op": "delete",
+      "id": 1
+    }
+  ]
+}
+
+
+Supported ops:
+
+"add"
+
+"edit"
+
+"delete"
+
+5. API USAGE SUMMARY FOR MOBILE APP
+5.1 During Device Setup (SoftAP)
+
+App connects to:
+
+MedBoxConfig (password: medbox)
+
+
+Send:
+
+POST /api/wifi
+
+JSON:
+{"ssid":"MyWiFi","pass":"12345678"}
+
+
+Then device reboots → joins home WiFi.
+
+5.2 During Normal Operation (Home WiFi)
+
+Base URL:
+
+http://medbox.local
+
+
+Actions:
+
+Action	API
+Get medicines	GET /api/meds
+Add medicine	POST /api/add
+Edit medicine	POST /api/edit?id=
+Delete medicine	POST /api/delete?id=
+Toggle medicine	POST /api/toggle?id=
+Get RTC time	GET /api/time
+Test alarm	POST /api/test
+Get settings	GET /api/settings
+Update settings	POST /api/settings
+Sync time (internet)	POST /api/sync_ntp
+Sync time (manual)	POST /api/set_time
+6. FINAL NOTES FOR APP DEVELOPMENT
+
+SoftAP API requires NO API key.
+
+Normal mode requires API_KEY = MEDBOX2025.
+
+Device ID is unique (maxpark03) and included in all cloud sync.
+
+Cloud sync has:
+
+POST (device → server)
+
+GET (server → device commands)
+
+Automatic GET polling every 2 minutes.
+
+If offline, ESP32 does NOT queue, retry, or slow down.
