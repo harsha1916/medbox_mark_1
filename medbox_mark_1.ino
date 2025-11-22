@@ -4,6 +4,11 @@
    - Unique device ID
    - Cloud POST + Cloud GET polling (no port forwarding)
    - Short HTTP timeouts to avoid slowdowns
+   - SoftAP config portal (WiFi + Scan)
+   - mDNS: medbox.local & medboxconfig.local
+   - /api/wifi JSON endpoint for app-based config
+   - UDP discovery + broadcast (deviceId, IP, paired status)
+   - NEW: Broadcast / discovery only if isPaired == false
 *************************************************************/
 
 #include <WiFi.h>
@@ -13,10 +18,12 @@
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <ESPmDNS.h>
+#include <WiFiUdp.h>
 
-// ---------------------- HARD-CODED WIFI ----------------------
-const char* WIFI_SSID = "Coolkaru info solutions";
-const char* WIFI_PASS = "Coolnew@123";
+// ---------------------- HARD-CODED WIFI (DEFAULT) ----------------------
+const char* WIFI_SSID_DEFAULT = "Coolkaru info solutions";
+const char* WIFI_PASS_DEFAULT = "Coolnew@123";
 
 // ---------------------- API KEY ------------------------------
 #define API_KEY "MEDBOX2025"
@@ -24,7 +31,6 @@ const char* WIFI_PASS = "Coolnew@123";
 // ---------------------- PIN DEFINITIONS -----------------------
 #define SETUP_PIN   14
 #define BUZZER_PIN  15
-
 int LED_PINS[10] = {4, 16, 17, 18, 19, 23, 25, 26, 27, 32};
 
 // ---------------------- OBJECTS ------------------------------
@@ -32,13 +38,17 @@ WebServer server(80);
 Preferences prefs;
 RTC_DS3231 rtc;
 
+// ---------------------- WIFI CONFIG (NVS) --------------------
+String wifiSsid;
+String wifiPass;
+
 // ---------------------- MEDICINES ----------------------------
 const int MAX_MEDS = 10;
 
 struct Medicine {
   String name;
   int qty;
-  int hour;     // 24-hour stored
+  int hour;     // 24-hour
   int minute;
   int led;      // 1-10
   bool enabled;
@@ -54,23 +64,28 @@ String globalApiUrl = "";   // POST URL
 String globalGetUrl = "";   // GET URL for commands
 bool onlineSyncEnabled = false;
 
-// ---------------------- DEVICE ID -----------------------------
-String deviceId = "maxpark03";
+// ---------------------- DEVICE ID & PAIRED STATUS ------------
+String deviceId = "maxpark02";  // change per device
+bool isPaired = false;          // stored in NVS, used for discovery
 
 // ---------------------- CLOUD POLLING -------------------------
 unsigned long lastPoll = 0;
 const unsigned long POLL_INTERVAL_MS = 120000UL;  // 2 minutes
 
+// ---------------------- UDP DISCOVERY -------------------------
+WiFiUDP udp;
+const uint16_t UDP_PORT = 4210;
+unsigned long lastUdpBroadcast = 0;
+const unsigned long UDP_BROADCAST_INTERVAL_MS = 5000UL; // 5 seconds
+
 /*************************************************************
                       API KEY HELPERS
 *************************************************************/
 bool checkAPIKey() {
-  // 1) Header
   if (server.hasHeader("API_KEY")) {
     String key = server.header("API_KEY");
     if (key == API_KEY) return true;
   }
-  // 2) Query ?api_key= or ?key=
   if (server.hasArg("api_key")) {
     if (server.arg("api_key") == API_KEY) return true;
   }
@@ -91,6 +106,44 @@ void initDeviceId() {
   prefs.putString("deviceId", deviceId);
   Serial.print("Device ID: ");
   Serial.println(deviceId);
+}
+
+/*************************************************************
+                      WIFI CONFIG HELPERS
+*************************************************************/
+void loadWifiConfig() {
+  wifiSsid = prefs.getString("wifi_ssid", WIFI_SSID_DEFAULT);
+  wifiPass = prefs.getString("wifi_pass", WIFI_PASS_DEFAULT);
+
+  Serial.print("Loaded WiFi SSID from NVS (or default): ");
+  Serial.println(wifiSsid);
+}
+
+void saveWifiConfig(const String &s, const String &p) {
+  prefs.putString("wifi_ssid", s);
+  prefs.putString("wifi_pass", p);
+  wifiSsid = s;
+  wifiPass = p;
+
+  Serial.println("WiFi credentials saved to NVS:");
+  Serial.print("SSID: ");
+  Serial.println(wifiSsid);
+}
+
+/*************************************************************
+                      PAIRED FLAG HELPERS
+*************************************************************/
+void loadPairedFlag() {
+  isPaired = prefs.getBool("paired", false); // default unpaired
+  Serial.print("Loaded paired flag: ");
+  Serial.println(isPaired ? "true" : "false");
+}
+
+void savePairedFlag(bool val) {
+  isPaired = val;
+  prefs.putBool("paired", isPaired);
+  Serial.print("Paired flag updated: ");
+  Serial.println(isPaired ? "true" : "false");
 }
 
 /*************************************************************
@@ -137,21 +190,18 @@ void maybeSyncToCloud() {
   HTTPClient http;
   http.begin(globalApiUrl);
   http.addHeader("Content-Type", "application/json");
-  http.setTimeout(2000);  // 2 seconds max
+  http.setTimeout(2000);
 
   int code = http.POST(payload);
   Serial.print("Cloud response code: ");
   Serial.println(code);
 
   http.end();
-  // No pending, no retry – just attempt once and return.
 }
 
 /*************************************************************
                       NVS HELPERS
 *************************************************************/
-
-// Save medicines to NVS as "name|qty|hour|min|led|enabled"
 void saveMeds() {
   prefs.putInt("medCount", medCount);
 
@@ -167,14 +217,12 @@ void saveMeds() {
     prefs.putString(key.c_str(), data);
   }
 
-  // Clear old slots beyond medCount
   for (int i = medCount; i < MAX_MEDS; i++) {
     String key = "med" + String(i);
     prefs.remove(key.c_str());
   }
 
   Serial.println("Medicines saved to NVS.");
-  // If cloud sync is ON, push immediately (no queue)
   maybeSyncToCloud();
 }
 
@@ -196,7 +244,7 @@ void loadMeds() {
       if (data[k] == '|') pipeCount++;
     }
 
-    if (pipeCount < 4) {  // corrupted
+    if (pipeCount < 4) {
       medCount = i;
       break;
     }
@@ -213,11 +261,9 @@ void loadMeds() {
     meds[i].minute = data.substring(p3 + 1, p4).toInt();
 
     if (pipeCount == 4) {
-      // old format: name|qty|hour|min|led
       meds[i].led = data.substring(p4 + 1).toInt();
       meds[i].enabled = true;
     } else {
-      // new format: name|qty|hour|min|led|enabled
       p5 = data.indexOf('|', p4 + 1);
       if (p5 < 0) {
         meds[i].led = data.substring(p4 + 1).toInt();
@@ -237,7 +283,7 @@ void loadMeds() {
 }
 
 /*************************************************************
-                    NTP → RTC SYNC
+                    NTP  RTC SYNC
 *************************************************************/
 void syncTimeNTP() {
   configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
@@ -381,7 +427,7 @@ void handleAdd() {
     m.led    = server.arg("led").toInt();
     if (m.led < 1) m.led = 1;
     if (m.led > 10) m.led = 10;
-    m.enabled = true;   // default enabled
+    m.enabled = true;
 
     meds[medCount++] = m;
     saveMeds();
@@ -453,7 +499,6 @@ void handleAdd() {
                        EDIT MEDICINE
 *************************************************************/
 void handleEdit() {
-  // POST: apply edit
   if (server.method() == HTTP_POST) {
     int idx = server.arg("index").toInt();
     if (idx < 0 || idx >= medCount) {
@@ -487,7 +532,6 @@ void handleEdit() {
     return;
   }
 
-  // GET: show edit form
   if (!server.hasArg("i")) {
     server.sendHeader("Location", "/");
     server.send(303);
@@ -521,7 +565,6 @@ void handleEdit() {
 
   page += "Time (AM/PM):<div class='row'>";
 
-  // Hour
   page += "<div class='col-4'><select class='form-control' name='hour'>";
   for (int h = 1; h <= 12; h++) {
     page += "<option";
@@ -530,7 +573,6 @@ void handleEdit() {
   }
   page += "</select></div>";
 
-  // Minute
   page += "<div class='col-4'><select class='form-control' name='minute'>";
   for (int mm = 0; mm < 60; mm++) {
     page += "<option";
@@ -539,7 +581,6 @@ void handleEdit() {
   }
   page += "</select></div>";
 
-  // AM/PM
   page += "<div class='col-4'><select class='form-control' name='ampm'>";
   page += "<option";
   if (ap == "AM") page += " selected";
@@ -551,7 +592,6 @@ void handleEdit() {
 
   page += "</div><br>";
 
-  // LED
   page += "LED Slot (1–10):<input type='number' class='form-control' name='led' value='" + String(m.led) + "' required><br>";
 
   page += "<button class='btn btn-primary'>Update</button>";
@@ -611,7 +651,6 @@ void handleDelete() {
 *************************************************************/
 void testAlarm() {
   Serial.println("Running Test Alarm...");
-  // Turn ON all LEDs + buzzer
   for (int i = 0; i < 10; i++) {
     digitalWrite(LED_PINS[i], HIGH);
   }
@@ -619,7 +658,6 @@ void testAlarm() {
 
   delay(alarmDuration * 1000);
 
-  // Turn OFF all
   for (int i = 0; i < 10; i++) {
     digitalWrite(LED_PINS[i], LOW);
   }
@@ -646,10 +684,9 @@ void handleSettings() {
     } else if (action == "test") {
       testAlarm();
     } else if (action == "cloud") {
-      // Save Cloud API URLs + sync toggle
       globalApiUrl = server.arg("apiUrl");
       globalGetUrl = server.arg("getUrl");
-      bool newSync = server.hasArg("sync");  // checkbox present if checked
+      bool newSync = server.hasArg("sync");
       onlineSyncEnabled = newSync;
       prefs.putString("apiUrl", globalApiUrl);
       prefs.putString("getUrl", globalGetUrl);
@@ -661,7 +698,6 @@ void handleSettings() {
       Serial.print("Online Sync: ");
       Serial.println(onlineSyncEnabled ? "ENABLED" : "DISABLED");
 
-      // Optional: immediate sync once
       maybeSyncToCloud();
     }
 
@@ -674,16 +710,15 @@ void handleSettings() {
 
   page += "<h4>Settings</h4>";
 
-  // Internet status badge
   bool online = (WiFi.status() == WL_CONNECTED);
   String badgeClass = online ? "bg-success" : "bg-danger";
   String statusText = online ? "Online" : "Offline";
   page += "<p>Internet Status: <span class='badge " + badgeClass + "'>" + statusText + "</span></p>";
 
-  // Show Device ID
   page += "<p>Device ID: <code>" + deviceId + "</code></p>";
+  page += "<p>Paired Status: <span class='badge " + String(isPaired ? "bg-primary" : "bg-warning") + "'>" +
+          String(isPaired ? "Paired" : "Unpaired") + "</span></p>";
 
-  // Alarm duration
   page += "<div class='card mb-3'><div class='card-header'>Alarm Settings</div><div class='card-body'>";
   page += "<form method='POST'>";
   page += "<input type='hidden' name='action' value='save'>";
@@ -691,7 +726,6 @@ void handleSettings() {
   page += "<button class='btn btn-primary'>Save Duration</button>";
   page += "</form></div></div>";
 
-  // RTC & Test
   page += "<div class='card mb-3'><div class='card-header'>RTC & Alarm Test</div><div class='card-body'>";
   page += "<form method='POST'>";
   page += "<input type='hidden' name='action' value='sync'>";
@@ -703,7 +737,6 @@ void handleSettings() {
   page += "</form>";
   page += "</div></div>";
 
-  // Cloud Integration
   page += "<div class='card mb-3'><div class='card-header'>Cloud Integration</div><div class='card-body'>";
   page += "<form method='POST'>";
   page += "<input type='hidden' name='action' value='cloud'>";
@@ -713,7 +746,6 @@ void handleSettings() {
   page += "<label>Global API GET URL (Cloud → ESP32 commands)</label>";
   page += "<input class='form-control' name='getUrl' value='" + globalGetUrl + "' placeholder='https://example.com/medbox/changes'><br>";
 
-  // Toggle switch
   page += "<div class='form-check form-switch'>";
   page += "<input class='form-check-input' type='checkbox' id='syncSwitch' name='sync' ";
   if (onlineSyncEnabled) page += "checked";
@@ -730,22 +762,151 @@ void handleSettings() {
 }
 
 /*************************************************************
-                         SOFTAP MODE
+                    SOFTAP MODE CONFIG PORTAL
 *************************************************************/
+void handleSoftAPRoot() {
+  bool doScan = server.hasArg("scan");
+
+  String page;
+  page += F(
+    "<!DOCTYPE html><html><head>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>MedBox WiFi Setup</title>"
+    "<link href='https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css' rel='stylesheet'>"
+    "</head><body><div class='container mt-3'>"
+    "<h3 class='mb-3'>MedBox WiFi Setup (SoftAP)</h3>"
+    "<div class='alert alert-info'>"
+    "You are connected to <b>MedBoxConfig</b>.<br>"
+    "You can also try: <code>http://medboxconfig.local</code>."
+    "</div>"
+  );
+
+  page += "<div class='card mb-3'><div class='card-header'>WiFi Credentials</div><div class='card-body'>";
+  page += "<form method='POST' action='/savewifi'>";
+  page += "<label class='form-label'>WiFi SSID</label>";
+  page += "<input class='form-control' name='ssid' value='" + wifiSsid + "' placeholder='HomeWiFi' required><br>";
+  page += "<label class='form-label'>WiFi Password</label>";
+  page += "<input class='form-control' type='password' name='pass' placeholder='********'><br>";
+  page += "<button class='btn btn-primary'>Save & Reboot</button>";
+  page += "</form></div></div>";
+
+  page += "<div class='card mb-3'><div class='card-header'>Scan Networks</div><div class='card-body'>";
+  page += "<form method='GET' action='/'>";
+  page += "<button class='btn btn-secondary' name='scan' value='1'>Scan WiFi Networks</button>";
+  page += "</form><br>";
+
+  if (doScan) {
+    int n = WiFi.scanNetworks();
+    if (n <= 0) {
+      page += "<p>No networks found.</p>";
+    } else {
+      page += "<ul class='list-group'>";
+      for (int i = 0; i < n; i++) {
+        page += "<li class='list-group-item d-flex justify-content-between align-items-center'>";
+        page += WiFi.SSID(i);
+        page += "<span class='badge bg-light text-dark'>";
+        page += String(WiFi.RSSI(i)) + " dBm";
+        if (WiFi.encryptionType(i) != WIFI_AUTH_OPEN) page += " 🔒";
+        page += "</span></li>";
+      }
+      page += "</ul>";
+    }
+  } else {
+    page += "<p>Click <b>Scan WiFi Networks</b> to see nearby SSIDs.</p>";
+  }
+
+  page += "</div></div>";
+
+  page += "<div class='alert alert-warning'>After saving WiFi details, the ESP32 will reboot and try to connect to the configured WiFi. Then open <code>http://medbox.local</code> from the same WiFi.</div>";
+
+  page += "</div></body></html>";
+
+  server.send(200, "text/html", page);
+}
+
+void handleSoftAPSaveWifi() {
+  if (!server.hasArg("ssid") || !server.hasArg("pass")) {
+    server.send(400, "text/plain", "Missing ssid or pass");
+    return;
+  }
+
+  String ssid = server.arg("ssid");
+  String pass = server.arg("pass");
+
+  saveWifiConfig(ssid, pass);
+
+  String page;
+  page += F(
+    "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>WiFi Saved</title></head><body><div class='container mt-3'>"
+    "<h3>WiFi credentials saved.</h3>"
+    "<p>Device will reboot now and attempt to connect to the configured WiFi.</p>"
+    "<p>After it connects, open <code>http://medbox.local</code>.</p>"
+    "</div></body></html>"
+  );
+  server.send(200, "text/html", page);
+
+  delay(1500);
+  ESP.restart();
+}
+
+// JSON WiFi config: POST /api/wifi { "ssid": "...", "pass": "..." }
+void apiSetWifi() {
+  DynamicJsonDocument doc(256);
+  DeserializationError err = deserializeJson(doc, server.arg("plain"));
+  if (err) {
+    server.send(400, "application/json", "{\"error\":\"invalid json\"}");
+    return;
+  }
+
+  String ssid = doc["ssid"] | "";
+  String pass = doc["pass"] | "";
+
+  if (ssid == "") {
+    server.send(400, "application/json", "{\"error\":\"ssid missing\"}");
+    return;
+  }
+
+  saveWifiConfig(ssid, pass);
+
+  server.send(200, "application/json", "{\"status\":\"saved_rebooting\"}");
+
+  Serial.println("WiFi credentials received via /api/wifi, rebooting...");
+  delay(1500);
+  ESP.restart();
+}
+
 void startSoftAP() {
   Serial.println("SOFTAP MODE ENABLED!");
 
-  WiFi.softAP("MedBoxConfig", "");
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("MedBoxConfig", "medbox");
 
-  server.on("/", []() {
-    String p = headerHTML("home");
-    p += "<div class='alert alert-info'>SoftAP Mode Enabled<br>SSID: MedBoxConfig</div>";
-    p += footerHTML();
-    server.send(200, "text/html", p);
-  });
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  if (!MDNS.begin("medboxconfig")) {
+    Serial.println("mDNS (medboxconfig) failed in SoftAP");
+  } else {
+    Serial.println("mDNS for SoftAP: http://medboxconfig.local");
+  }
+
+  // Start UDP only if device is unpaired  // <<<
+  if (!isPaired) {
+    if (udp.begin(UDP_PORT)) {
+      Serial.print("UDP listening (SoftAP) on port ");
+      Serial.println(UDP_PORT);
+    } else {
+      Serial.println("UDP begin failed in SoftAP!");
+    }
+  }
+
+  server.on("/", handleSoftAPRoot);
+  server.on("/savewifi", HTTP_POST, handleSoftAPSaveWifi);
+  server.on("/api/wifi", HTTP_POST, apiSetWifi);
 
   server.begin();
-  Serial.println("AP IP: 192.168.4.1");
+  Serial.println("HTTP server started in SoftAP mode");
 }
 
 /*************************************************************
@@ -776,22 +937,12 @@ void checkAlarms() {
 
 /*************************************************************
                   CLOUD GET POLLING (EVERY 2 MIN)
-   Expected JSON from cloud (example):
-
-   {
-     "commands": [
-       {"op":"add","name":"Dolo","qty":1,"hour":9,"minute":30,"led":2,"enabled":true},
-       {"op":"edit","id":0,"hour":10},
-       {"op":"delete","id":1}
-     ]
-   }
 *************************************************************/
 void pollCloud() {
   if (!onlineSyncEnabled) return;
   if (WiFi.status() != WL_CONNECTED) return;
   if (globalGetUrl.length() == 0) return;
 
-  // Build URL with deviceId as query
   String url = globalGetUrl;
   if (url.indexOf("?") >= 0)
     url += "&deviceId=" + deviceId;
@@ -800,7 +951,7 @@ void pollCloud() {
 
   HTTPClient http;
   http.begin(url);
-  http.setTimeout(2000);  // 2 seconds max
+  http.setTimeout(2000);
 
   int code = http.GET();
   if (code != 200) {
@@ -892,7 +1043,7 @@ void pollCloud() {
   }
 
   if (changed) {
-    saveMeds();   // also triggers maybeSyncToCloud()
+    saveMeds();
   }
 }
 
@@ -907,6 +1058,7 @@ void apiGetMeds() {
   DynamicJsonDocument doc(4096);
   doc["deviceId"] = deviceId;
   doc["count"] = medCount;
+  doc["paired"] = isPaired;
   JsonArray arr = doc.createNestedArray("meds");
 
   for (int i = 0; i < medCount; i++) {
@@ -978,11 +1130,11 @@ void apiEditMed() {
     return;
   }
 
-  meds[id].name = doc["name"] | meds[id].name;
-  meds[id].qty = doc["qty"] | meds[id].qty;
-  meds[id].hour = doc["hour"] | meds[id].hour;
-  meds[id].minute = doc["minute"] | meds[id].minute;
-  meds[id].led = doc["led"] | meds[id].led;
+  meds[id].name    = doc["name"]    | meds[id].name;
+  meds[id].qty     = doc["qty"]     | meds[id].qty;
+  meds[id].hour    = doc["hour"]    | meds[id].hour;
+  meds[id].minute  = doc["minute"]  | meds[id].minute;
+  meds[id].led     = doc["led"]     | meds[id].led;
   meds[id].enabled = doc["enabled"] | meds[id].enabled;
 
   if (meds[id].led < 1) meds[id].led = 1;
@@ -1072,6 +1224,7 @@ void apiGetSettings() {
   doc["cloudGetUrl"] = globalGetUrl;
   doc["onlineSync"] = onlineSyncEnabled;
   doc["internet"] = (WiFi.status() == WL_CONNECTED);
+  doc["paired"] = isPaired;
 
   String out;
   serializeJson(doc, out);
@@ -1110,6 +1263,11 @@ void apiUpdateSettings() {
     prefs.putBool("syncOn", onlineSyncEnabled);
   }
 
+  if (doc.containsKey("paired")) {
+    bool p = doc["paired"];
+    savePairedFlag(p);
+  }
+
   server.send(200, "application/json", "{\"status\":\"updated\"}");
 }
 
@@ -1122,8 +1280,7 @@ void apiSyncNTP() {
 }
 
 // POST /api/set_time
-// JSON: {"year":2025,"month":11,"day":13,"hour":15,"minute":30,"second":0}
-void apiSetTime() {
+void apiSetTimeRTC() {
   if (!checkAPIKey()) return rejectUnauthorized();
 
   DynamicJsonDocument doc(256);
@@ -1144,6 +1301,98 @@ void apiSetTime() {
   server.send(200, "application/json", "{\"status\":\"rtc_set\"}");
 }
 
+// POST /api/pair  (app sets paired/unpaired explicitly)
+void apiPair() {
+  if (!checkAPIKey()) return rejectUnauthorized();
+
+  DynamicJsonDocument doc(128);
+  DeserializationError err = deserializeJson(doc, server.arg("plain"));
+  if (err) {
+    server.send(400, "application/json", "{\"error\":\"invalid json\"}");
+    return;
+  }
+
+  bool p = doc["paired"] | true;
+  savePairedFlag(p);
+
+  server.send(200, "application/json", "{\"status\":\"pair_updated\"}");
+}
+
+/*************************************************************
+                      UDP DISCOVERY HELPERS
+*************************************************************/
+void buildDiscoveryJson(String &payload) {
+  DynamicJsonDocument doc(256);
+  doc["type"] = "medbox";
+  doc["deviceId"] = deviceId;
+
+  // Use correct IP depending on mode (STA vs AP)  // <<<
+  String ipStr;
+  if (WiFi.getMode() == WIFI_AP) {
+    ipStr = WiFi.softAPIP().toString();
+  } else {
+    ipStr = WiFi.localIP().toString();
+  }
+  doc["ip"] = ipStr;
+
+  doc["paired"] = isPaired;
+  serializeJson(doc, payload);
+}
+
+// periodic broadcast to 255.255.255.255, ONLY if unpaired  // <<<
+void broadcastDiscovery() {
+  if (isPaired) return;  // no broadcast if already paired
+  if (WiFi.status() != WL_CONNECTED && WiFi.getMode() != WIFI_AP) return;
+
+  String payload;
+  buildDiscoveryJson(payload);
+
+  udp.beginPacket("255.255.255.255", UDP_PORT);
+  udp.write((const uint8_t*)payload.c_str(), payload.length());
+  udp.endPacket();
+
+  Serial.print("UDP broadcast: ");
+  Serial.println(payload);
+}
+
+// handle discovery requests from app (only if unpaired)  // <<<
+void handleUdpPacket() {
+  if (isPaired) {
+    // if you want to still answer queries when paired, remove this line
+    return;
+  }
+
+  int packetSize = udp.parsePacket();
+  if (packetSize <= 0) return;
+
+  char buf[64];
+  int len = udp.read(buf, sizeof(buf) - 1);
+  if (len <= 0) return;
+  buf[len] = 0;
+
+  String msg = String(buf);
+  msg.trim();
+
+  if (msg == "DISCOVER_MEDBOX") {
+    String payload;
+    buildDiscoveryJson(payload);
+
+    IPAddress remoteIp = udp.remoteIP();
+    uint16_t remotePort = udp.remotePort();
+
+    udp.beginPacket(remoteIp, remotePort);
+    udp.write((const uint8_t*)payload.c_str(), payload.length());
+    udp.endPacket();
+
+    Serial.print("UDP unicast response to discovery: ");
+    Serial.print(remoteIp);
+    Serial.print(":");
+    Serial.print(remotePort);
+    Serial.print(" -> ");
+    Serial.println(payload);
+  }
+}
+
 /*************************************************************
                             SETUP
 *************************************************************/
@@ -1158,14 +1407,15 @@ void setup() {
   pinMode(BUZZER_PIN, OUTPUT);
   for (int i = 0; i < 10; i++) pinMode(LED_PINS[i], OUTPUT);
 
-  // Device ID must be ready early
   initDeviceId();
 
-  // Load settings + cloud config + medicines from NVS
   alarmDuration = prefs.getInt("duration", 10);
   globalApiUrl = prefs.getString("apiUrl", "");
   globalGetUrl = prefs.getString("getUrl", "");
   onlineSyncEnabled = prefs.getBool("syncOn", false);
+  loadWifiConfig();
+  loadPairedFlag();
+  loadMeds();
 
   Serial.print("Loaded alarmDuration = ");
   Serial.println(alarmDuration);
@@ -1176,21 +1426,23 @@ void setup() {
   Serial.print("Online Sync Enabled = ");
   Serial.println(onlineSyncEnabled ? "YES" : "NO");
 
-  loadMeds();
-
   if (!rtc.begin()) {
     Serial.println("RTC NOT FOUND!");
   }
 
   delay(100);
   if (digitalRead(SETUP_PIN) == LOW) {
+    // factory/config mode – mark as unpaired and enter SoftAP
+    savePairedFlag(false);
     startSoftAP();
     return;
   }
 
-  // Normal WiFi Mode
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.println("Connecting to WiFi...");
+  // Normal WiFi Mode (STA)
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+  Serial.print("Connecting to WiFi SSID: ");
+  Serial.println(wifiSsid);
 
   int t = 0;
   while (WiFi.status() != WL_CONNECTED && t < 40) {
@@ -1203,8 +1455,26 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.print("Connected! IP: ");
     Serial.println(WiFi.localIP());
+
+    if (!MDNS.begin("medbox")) {
+      Serial.println("mDNS start failed for medbox");
+    } else {
+      Serial.println("mDNS: http://medbox.local");
+    }
+
+    // start UDP only if unpaired  // <<<
+    if (!isPaired) {
+      if (udp.begin(UDP_PORT)) {
+        Serial.print("UDP listening (STA) on port ");
+        Serial.println(UDP_PORT);
+      } else {
+        Serial.println("UDP begin failed (STA)!");
+      }
+    }
+
   } else {
     Serial.println("WiFi Failed! Switching to SoftAP...");
+    savePairedFlag(false);  // in failure, treat as unpaired
     startSoftAP();
     return;
   }
@@ -1228,9 +1498,10 @@ void setup() {
   server.on("/api/settings", HTTP_GET, apiGetSettings);
   server.on("/api/settings", HTTP_POST, apiUpdateSettings);
   server.on("/api/sync_ntp", HTTP_POST, apiSyncNTP);
-  server.on("/api/set_time", HTTP_POST, apiSetTime);
+  server.on("/api/set_time", HTTP_POST, apiSetTimeRTC);
+  server.on("/api/wifi", HTTP_POST, apiSetWifi);   // in STA mode also
+  server.on("/api/pair", HTTP_POST, apiPair);
 
-  // Collect custom API_KEY header
   const char* headerKeys[] = {"API_KEY"};
   server.collectHeaders(headerKeys, 1);
 
@@ -1244,9 +1515,21 @@ void loop() {
   server.handleClient();
   checkAlarms();
 
-  unsigned long now = millis();
-  if (now - lastPoll > POLL_INTERVAL_MS) {
-    lastPoll = now;
+  unsigned long nowMs = millis();
+
+  // cloud poll
+  if (nowMs - lastPoll > POLL_INTERVAL_MS) {
+    lastPoll = nowMs;
     pollCloud();
+  }
+
+  // UDP discovery: handle incoming & broadcast periodically
+  handleUdpPacket();  // does nothing if isPaired == true
+
+  if ((WiFi.status() == WL_CONNECTED || WiFi.getMode() == WIFI_AP) &&
+      !isPaired &&                                        // <<<
+      (nowMs - lastUdpBroadcast > UDP_BROADCAST_INTERVAL_MS)) {
+    lastUdpBroadcast = nowMs;
+    broadcastDiscovery();
   }
 }
