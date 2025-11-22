@@ -26,6 +26,34 @@ lock = threading.Lock()
 
 
 # ---------------------------------------------------------
+# Time helpers
+# ---------------------------------------------------------
+def now_iso():
+    """Return current time in UTC ISO-8601 format."""
+    return datetime.utcnow().isoformat()
+
+
+def human(ts: str):
+    """
+    Convert ISO-8601 timestamp string to a human readable form.
+    Returns '-' for None/empty, or original string if parse fails.
+    """
+    if not ts:
+        return "-"
+    try:
+        dt = datetime.fromisoformat(ts)
+        # Example: "18 Nov 2025 • 09:28:49 PM"
+        return dt.strftime("%d %b %Y • %I:%M:%S %p")
+    except Exception:
+        # If something weird is stored, show raw
+        return ts
+
+
+# Make human() available inside templates
+app.jinja_env.globals.update(human=human)
+
+
+# ---------------------------------------------------------
 # JSON helpers
 # ---------------------------------------------------------
 def load_json_file(path: Path, default):
@@ -45,10 +73,6 @@ def save_json_file(path: Path, data):
             json.dump(data, f, indent=2)
     except Exception as e:
         print(f"Error saving {path.name}: {e}")
-
-
-def now_iso():
-    return datetime.utcnow().isoformat()
 
 
 def load_state():
@@ -185,7 +209,7 @@ def get_changes():
     return jsonify({"commands": cmds})
 
 
-# Helper endpoints to enqueue commands (from your dashboard / mobile app)
+# Helper endpoints to enqueue commands (from dashboard / mobile app)
 
 @app.post("/medbox/<device_id>/command/add")
 def add_command(device_id):
@@ -278,7 +302,7 @@ INDEX_TEMPLATE = """
 <body class="bg-light">
 <div class="container mt-4">
   <div class="d-flex justify-content-between align-items-center">
-    <h2>💊 MedBox Dashboard</h2>
+    <h2> MedBox Dashboard</h2>
     <a class="btn btn-primary" href="{{ url_for('new_device') }}">+ New Device</a>
   </div>
   <hr>
@@ -303,8 +327,8 @@ INDEX_TEMPLATE = """
         <td>{{ loop.index }}</td>
         <td>{{ d.friendly_name }}</td>
         <td><code>{{ d.deviceId }}</code></td>
-        <td>{{ d.last_seen_upload or "-" }}</td>
-        <td>{{ d.last_seen_changes or "-" }}</td>
+        <td>{{ human(d.last_seen_upload) }}</td>
+        <td>{{ human(d.last_seen_changes) }}</td>
         <td>{{ d.meds_count }}</td>
         <td>{{ d.pending_count }}</td>
         <td>{{ d.sent_count }}</td>
@@ -335,19 +359,27 @@ DEVICE_TEMPLATE = """
 </head>
 <body class="bg-light">
 <div class="container mt-4">
-  <a href="{{ url_for('index') }}" class="btn btn-secondary mb-3">&laquo; Back</a>
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <a href="{{ url_for('index') }}" class="btn btn-secondary">&laquo; Back</a>
+
+    <form method="POST" action="{{ url_for('delete_device', device_id=meta.deviceId) }}"
+          onsubmit="return confirm('Delete this device and all history? This cannot be undone.');">
+      <button class="btn btn-danger">Delete Device</button>
+    </form>
+  </div>
+
   <h3>Device: {{ meta.friendly_name }}</h3>
   <p>
     <b>Device ID:</b> <code>{{ meta.deviceId }}</code><br>
-    <b>Created at:</b> {{ meta.created_at }}<br>
-    <b>Last Upload:</b> {{ meta.last_seen_upload or "-" }}<br>
-    <b>Last Changes Poll:</b> {{ meta.last_seen_changes or "-" }}<br>
+    <b>Created at:</b> {{ human(meta.created_at) }}<br>
+    <b>Last Upload:</b> {{ human(meta.last_seen_upload) }}<br>
+    <b>Last Changes Poll:</b> {{ human(meta.last_seen_changes) }}<br>
   </p>
 
   <hr>
   <h4>Current Medicines</h4>
   {% if snapshot %}
-    <p><b>Snapshot time:</b> {{ snapshot.timestamp }} | <b>Count:</b> {{ snapshot.count }}</p>
+    <p><b>Snapshot time:</b> {{ human(snapshot.timestamp) }} | <b>Count:</b> {{ snapshot.count }}</p>
     {% if snapshot.meds %}
       <table class="table table-sm table-striped table-bordered">
         <thead class="table-light">
@@ -380,7 +412,7 @@ DEVICE_TEMPLATE = """
   {% if pending %}
     <table class="table table-sm table-striped table-bordered">
       <thead class="table-light">
-        <tr><th>#</th><th>Op</th><th>Data</th></tr>
+        <tr><th>#</th><th>Op</th><th>Data</th><th>Actions</th></tr>
       </thead>
       <tbody>
       {% for c in pending %}
@@ -388,6 +420,13 @@ DEVICE_TEMPLATE = """
           <td>{{ loop.index }}</td>
           <td>{{ c.op }}</td>
           <td><pre style="margin:0;font-size:0.8rem;">{{ c|tojson(indent=2) }}</pre></td>
+          <td>
+            <form method="POST"
+                  action="{{ url_for('delete_pending', device_id=meta.deviceId, idx=loop.index0) }}"
+                  onsubmit="return confirm('Delete this pending command?');">
+              <button class="btn btn-sm btn-outline-danger">Delete</button>
+            </form>
+          </td>
         </tr>
       {% endfor %}
       </tbody>
@@ -401,7 +440,7 @@ DEVICE_TEMPLATE = """
   {% if history %}
     <table class="table table-sm table-striped table-bordered">
       <thead class="table-light">
-        <tr><th>#</th><th>Op</th><th>Status</th><th>Sent at</th><th>Data</th></tr>
+        <tr><th>#</th><th>Op</th><th>Status</th><th>Sent at</th><th>Data</th><th>Actions</th></tr>
       </thead>
       <tbody>
       {% for c in history %}
@@ -409,8 +448,15 @@ DEVICE_TEMPLATE = """
           <td>{{ loop.index }}</td>
           <td>{{ c.op }}</td>
           <td>{{ c.status }}</td>
-          <td>{{ c.sent_at or "-" }}</td>
+          <td>{{ human(c.sent_at) }}</td>
           <td><pre style="margin:0;font-size:0.8rem;">{{ c|tojson(indent=2) }}</pre></td>
+          <td>
+            <form method="POST"
+                  action="{{ url_for('delete_history', device_id=meta.deviceId, idx=loop.index0) }}"
+                  onsubmit="return confirm('Delete this history record?');">
+              <button class="btn btn-sm btn-outline-danger">Delete</button>
+            </form>
+          </td>
         </tr>
       {% endfor %}
       </tbody>
@@ -455,6 +501,10 @@ NEW_DEVICE_TEMPLATE = """
 </html>
 """
 
+
+# ---------------------------------------------------------
+# Dashboard routes
+# ---------------------------------------------------------
 
 @app.get("/")
 def index():
@@ -517,7 +567,7 @@ def device_detail(device_id):
         pending = devices_commands_pending.get(device_id, [])
         history = devices_commands_history.get(device_id, [])
 
-    snapshot = None
+    snapshot = None    #
     if snap:
         snapshot = type("Snap", (), {
             "timestamp": snap.get("timestamp"),
@@ -535,10 +585,67 @@ def device_detail(device_id):
 
 
 # ---------------------------------------------------------
+# Delete device (ALL data)
+# ---------------------------------------------------------
+@app.post("/device/<device_id>/delete")
+def delete_device(device_id):
+    """
+    Delete everything related to a device:
+    - meta
+    - last meds snapshot
+    - pending commands
+    - history
+    """
+    with lock:
+        devices_meta.pop(device_id, None)
+        devices_meds.pop(device_id, None)
+        devices_commands_pending.pop(device_id, None)
+        devices_commands_history.pop(device_id, None)
+
+        save_json_file(META_FILE, devices_meta)
+        save_json_file(MEDS_FILE, devices_meds)
+        save_json_file(PENDING_FILE, devices_commands_pending)
+        save_json_file(HISTORY_FILE, devices_commands_history)
+
+    print(f"[DELETE] Removed device {device_id} and all related data.")
+    return redirect(url_for("index"))
+
+
+# ---------------------------------------------------------
+# Delete single pending command
+# ---------------------------------------------------------
+@app.post("/device/<device_id>/pending/<int:idx>/delete")
+def delete_pending(device_id, idx):
+    with lock:
+        lst = devices_commands_pending.get(device_id, [])
+        if 0 <= idx < len(lst):
+            del lst[idx]
+            devices_commands_pending[device_id] = lst
+            save_json_file(PENDING_FILE, devices_commands_pending)
+    print(f"[DELETE_PENDING] device={device_id}, idx={idx}")
+    return redirect(url_for("device_detail", device_id=device_id))
+
+
+# ---------------------------------------------------------
+# Delete single history record
+# ---------------------------------------------------------
+@app.post("/device/<device_id>/history/<int:idx>/delete")
+def delete_history(device_id, idx):
+    with lock:
+        lst = devices_commands_history.get(device_id, [])
+        if 0 <= idx < len(lst):
+            del lst[idx]
+            devices_commands_history[device_id] = lst
+            save_json_file(HISTORY_FILE, devices_commands_history)
+    print(f"[DELETE_HISTORY] device={device_id}, idx={idx}")
+    return redirect(url_for("device_detail", device_id=device_id))
+
+
+# ---------------------------------------------------------
 # Startup
 # ---------------------------------------------------------
 
 if __name__ == "__main__":
     load_state()
-    # Run on Raspberry Pi so ESP32 can reach it over LAN
+    # Run on Raspberry Pi / server so ESP32 can reach it over LAN
     app.run(host="0.0.0.0", port=8000, debug=True)
